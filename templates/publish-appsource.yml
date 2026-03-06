@@ -1,0 +1,252 @@
+name: Publish App
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: 'Publish target'
+        required: true
+        type: choice
+        options:
+          - sandbox
+          - customer
+          - appsource
+      environment_name:
+        description: 'BC environment name (sandbox / customer only)'
+        required: false
+        default: ''
+      bc_version:
+        description: 'BC artifact version (leave empty for latest)'
+        required: false
+        default: ''
+      confirm:
+        description: 'Type CONFIRM to proceed (prevents accidental runs)'
+        required: true
+        default: ''
+
+# No concurrency — never cancel an in-progress publish
+jobs:
+  # ─────────────────────────────────────────────
+  # Guard: prevent accidental runs
+  # ─────────────────────────────────────────────
+  guard:
+    name: Confirm publish intent
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check confirmation input
+        shell: bash
+        run: |
+          if [ "${{ github.event.inputs.confirm }}" != "CONFIRM" ]; then
+            echo "::error::Publish aborted — type CONFIRM in the confirm field to proceed"
+            exit 1
+          fi
+          echo "✓ Confirmation received"
+          echo "  Target:      ${{ github.event.inputs.target }}"
+          echo "  Environment: ${{ github.event.inputs.environment_name }}"
+          echo "  Triggered by: ${{ github.actor }}"
+
+  # ─────────────────────────────────────────────
+  # Build release .app file
+  # ─────────────────────────────────────────────
+  build:
+    name: Build release app
+    needs: guard
+    # ─────────────────────────────────────────
+    # To migrate to self-hosted: replace with
+    # runs-on: self-hosted
+    # ─────────────────────────────────────────
+    runs-on: windows-latest
+
+    outputs:
+      app-name: ${{ steps.app.outputs.name }}
+      app-version: ${{ steps.app.outputs.version }}
+      app-publisher: ${{ steps.app.outputs.publisher }}
+      app-file-name: ${{ steps.compile.outputs.appFileName }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Read app.json
+        id: app
+        shell: pwsh
+        run: |
+          $appJson = Get-Content "app.json" | ConvertFrom-Json
+          echo "name=$($appJson.name)" >> $env:GITHUB_OUTPUT
+          echo "version=$($appJson.version)" >> $env:GITHUB_OUTPUT
+          echo "publisher=$($appJson.publisher)" >> $env:GITHUB_OUTPUT
+          echo "bcVersion=$($appJson.application)" >> $env:GITHUB_OUTPUT
+          Write-Host "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          Write-Host "  App:       $($appJson.name)"
+          Write-Host "  Version:   $($appJson.version)"
+          Write-Host "  Publisher: $($appJson.publisher)"
+          Write-Host "  Target:    ${{ github.event.inputs.target }}"
+          Write-Host "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+      - name: Install BcContainerHelper
+        shell: pwsh
+        run: |
+          Set-PSRepository -Name PSGallery -InstallationPolicy Trusted
+          Install-Module BcContainerHelper -AllowClobber -Force
+          Write-Host "✓ BcContainerHelper installed"
+
+      - name: Resolve BC artifact version
+        id: artifacts
+        shell: pwsh
+        run: |
+          $requestedVersion = "${{ github.event.inputs.bc_version }}"
+          if ([string]::IsNullOrEmpty($requestedVersion)) {
+            $requestedVersion = "${{ steps.app.outputs.bcVersion }}"
+          }
+
+          $artifactUrl = Get-BCArtifactUrl `
+            -type Sandbox `
+            -country base `
+            -version $requestedVersion `
+            -select Latest
+
+          Write-Host "✓ Artifact: $artifactUrl"
+          echo "url=$artifactUrl" >> $env:GITHUB_OUTPUT
+
+          $artifactPath = Download-Artifacts -artifactUrl $artifactUrl -includePlatform
+          echo "path=$artifactPath" >> $env:GITHUB_OUTPUT
+
+      - name: Compile AL app (Release mode)
+        id: compile
+        shell: pwsh
+        run: |
+          $artifactPath = "${{ steps.artifacts.outputs.path }}"
+          $compilerPath = (Get-Item "$artifactPath\*\compiler\win32\alc.exe").FullName
+          $outputDir = Join-Path $env:RUNNER_TEMP "al-release"
+          New-Item -ItemType Directory -Force -Path $outputDir | Out-Null
+
+          $appFileName = "${{ steps.app.outputs.publisher }}_${{ steps.app.outputs.name }}_${{ steps.app.outputs.version }}.app"
+          $appFilePath = Join-Path $outputDir $appFileName
+
+          Write-Host "▶ Compiling $appFileName (Release)..."
+
+          & $compilerPath `
+            /project:"$env:GITHUB_WORKSPACE" `
+            /packagecachepath:"$env:GITHUB_WORKSPACE\.alpackages" `
+            /out:"$appFilePath" `
+            /analyzer:CodeCop `
+            /analyzer:UICop `
+            /analyzer:PerTenantExtensionCop `
+            /generatereportlayout-
+
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "::error::Compilation failed"
+            exit $LASTEXITCODE
+          }
+
+          Write-Host "✓ Compiled: $appFileName"
+          echo "appFileName=$appFileName" >> $env:GITHUB_OUTPUT
+          echo "appFilePath=$appFilePath" >> $env:GITHUB_OUTPUT
+          echo "outputDir=$outputDir" >> $env:GITHUB_OUTPUT
+
+      - name: Upload release artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ steps.app.outputs.version }}
+          path: ${{ steps.compile.outputs.appFilePath }}
+          retention-days: 90
+
+  # ─────────────────────────────────────────────
+  # Publish to Sandbox or Customer environment
+  # ─────────────────────────────────────────────
+  publish-bc:
+    name: Publish to BC environment
+    needs: build
+    if: ${{ github.event.inputs.target == 'sandbox' || github.event.inputs.target == 'customer' }}
+    runs-on: windows-latest
+
+    environment:
+      name: ${{ github.event.inputs.target }}
+
+    steps:
+      - name: Download release artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: release-${{ needs.build.outputs.app-version }}
+          path: ${{ runner.temp }}/release
+
+      - name: Install BcContainerHelper
+        shell: pwsh
+        run: |
+          Set-PSRepository -Name PSGallery -InstallationPolicy Trusted
+          Install-Module BcContainerHelper -AllowClobber -Force
+
+      - name: Publish to BC environment
+        shell: pwsh
+        run: |
+          $appFile = Get-ChildItem "${{ runner.temp }}/release" -Filter "*.app" | Select-Object -First 1
+
+          if (-not $appFile) {
+            Write-Host "::error::No .app file found in release artifact"
+            exit 1
+          }
+
+          $environmentName = "${{ github.event.inputs.environment_name }}"
+          if ([string]::IsNullOrEmpty($environmentName)) {
+            Write-Host "::error::environment_name is required for sandbox/customer publish"
+            exit 1
+          }
+
+          Write-Host "▶ Publishing $($appFile.Name) to $environmentName..."
+
+          Publish-BcContainerApp `
+            -bcAuthContext (New-BcAuthContext `
+              -tenantID "${{ secrets.BC_TENANT_ID }}" `
+              -clientID "${{ secrets.BC_CLIENT_ID }}" `
+              -clientSecret (ConvertTo-SecureString "${{ secrets.BC_CLIENT_SECRET }}" -AsPlainText -Force)) `
+            -environment $environmentName `
+            -appFile $appFile.FullName `
+            -useDevEndpoint:$false
+
+          Write-Host "✓ Published to $environmentName"
+          Write-Host "  App:     ${{ needs.build.outputs.app-name }}"
+          Write-Host "  Version: ${{ needs.build.outputs.app-version }}"
+
+  # ─────────────────────────────────────────────
+  # Publish to AppSource (upload to Partner Center)
+  # ─────────────────────────────────────────────
+  publish-appsource:
+    name: Prepare AppSource submission
+    needs: build
+    if: ${{ github.event.inputs.target == 'appsource' }}
+    runs-on: windows-latest
+
+    steps:
+      - name: Download release artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: release-${{ needs.build.outputs.app-version }}
+          path: ${{ runner.temp }}/release
+
+      - name: AppSource pre-submission summary
+        shell: pwsh
+        run: |
+          $appFile = Get-ChildItem "${{ runner.temp }}/release" -Filter "*.app" | Select-Object -First 1
+          $appSize = [math]::Round($appFile.Length / 1KB, 1)
+
+          Write-Host "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          Write-Host "  AppSource Submission Package Ready"
+          Write-Host "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          Write-Host "  File:      $($appFile.Name)"
+          Write-Host "  Size:      $appSize KB"
+          Write-Host "  App:       ${{ needs.build.outputs.app-name }}"
+          Write-Host "  Version:   ${{ needs.build.outputs.app-version }}"
+          Write-Host "  Publisher: ${{ needs.build.outputs.app-publisher }}"
+          Write-Host ""
+          Write-Host "  Next steps:"
+          Write-Host "  1. Download the .app artifact from this run"
+          Write-Host "  2. Complete skills/appsource-checklist.md"
+          Write-Host "  3. Upload to Partner Center manually"
+          Write-Host "  4. Submit for validation"
+          Write-Host "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+      # Note: Direct Partner Center API upload can be added here
+      # when Microsoft publishes a stable submission API.
+      # For now: manual upload from the downloaded artifact.
