@@ -1,0 +1,187 @@
+name: Build AL
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - '**.al'
+      - 'app.json'
+      - '.github/workflows/build-al.yml'
+  workflow_dispatch:
+    inputs:
+      bc_version:
+        description: 'BC artifact version (leave empty for latest)'
+        required: false
+        default: ''
+      upload_artifact:
+        description: 'Upload .app as GitHub artifact'
+        required: false
+        default: 'true'
+        type: boolean
+
+# Cancel in-progress runs on new push to main
+concurrency:
+  group: build-al-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build AL App
+    # ─────────────────────────────────────────
+    # To migrate to self-hosted: replace with
+    # runs-on: self-hosted
+    # ─────────────────────────────────────────
+    runs-on: windows-latest
+
+    outputs:
+      app-version: ${{ steps.app.outputs.version }}
+      app-name: ${{ steps.app.outputs.name }}
+      artifact-path: ${{ steps.compile.outputs.artifactPath }}
+
+    steps:
+      # ─────────────────────────────────────────
+      # 1. Checkout
+      # ─────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # ─────────────────────────────────────────
+      # 2. Read app.json metadata
+      # ─────────────────────────────────────────
+      - name: Read app.json
+        id: app
+        shell: pwsh
+        run: |
+          $appJson = Get-Content "app.json" | ConvertFrom-Json
+          echo "name=$($appJson.name)" >> $env:GITHUB_OUTPUT
+          echo "version=$($appJson.version)" >> $env:GITHUB_OUTPUT
+          echo "publisher=$($appJson.publisher)" >> $env:GITHUB_OUTPUT
+          echo "bcVersion=$($appJson.application)" >> $env:GITHUB_OUTPUT
+          Write-Host "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          Write-Host "  App:       $($appJson.name)"
+          Write-Host "  Version:   $($appJson.version)"
+          Write-Host "  Publisher: $($appJson.publisher)"
+          Write-Host "  BC target: $($appJson.application)+"
+          Write-Host "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+      # ─────────────────────────────────────────
+      # 3. Install BcContainerHelper
+      # ─────────────────────────────────────────
+      - name: Install BcContainerHelper
+        shell: pwsh
+        run: |
+          Set-PSRepository -Name PSGallery -InstallationPolicy Trusted
+          Install-Module BcContainerHelper -AllowClobber -Force
+          $version = Get-Module BcContainerHelper -ListAvailable |
+            Select-Object -First 1 -ExpandProperty Version
+          Write-Host "✓ BcContainerHelper $version installed"
+
+      # ─────────────────────────────────────────
+      # 4. Resolve BC artifact version
+      # ─────────────────────────────────────────
+      - name: Resolve BC artifact version
+        id: artifacts
+        shell: pwsh
+        run: |
+          # Use manual input version if provided, otherwise use app.json version
+          $requestedVersion = "${{ github.event.inputs.bc_version }}"
+          if ([string]::IsNullOrEmpty($requestedVersion)) {
+            $requestedVersion = "${{ steps.app.outputs.bcVersion }}"
+          }
+
+          $artifactUrl = Get-BCArtifactUrl `
+            -type Sandbox `
+            -country base `
+            -version $requestedVersion `
+            -select Latest
+
+          Write-Host "✓ Resolved artifact: $artifactUrl"
+          echo "url=$artifactUrl" >> $env:GITHUB_OUTPUT
+
+          $artifactPath = Download-Artifacts -artifactUrl $artifactUrl -includePlatform
+          Write-Host "✓ Artifacts downloaded to: $artifactPath"
+          echo "path=$artifactPath" >> $env:GITHUB_OUTPUT
+
+      # ─────────────────────────────────────────
+      # 5. Compile AL app (Release mode)
+      # ─────────────────────────────────────────
+      - name: Compile AL app
+        id: compile
+        shell: pwsh
+        run: |
+          $artifactPath = "${{ steps.artifacts.outputs.path }}"
+          $compilerPath = (Get-Item "$artifactPath\*\compiler\win32\alc.exe" -ErrorAction SilentlyContinue).FullName
+
+          if (-not $compilerPath) {
+            Write-Host "::error::AL compiler not found in artifacts"
+            exit 1
+          }
+
+          Write-Host "✓ Compiler: $compilerPath"
+
+          $outputDir = Join-Path $env:RUNNER_TEMP "al-output"
+          New-Item -ItemType Directory -Force -Path $outputDir | Out-Null
+
+          $appFileName = "${{ steps.app.outputs.publisher }}_${{ steps.app.outputs.name }}_${{ steps.app.outputs.version }}.app"
+          $appFilePath = Join-Path $outputDir $appFileName
+
+          Write-Host "▶ Compiling $appFileName..."
+
+          & $compilerPath `
+            /project:"$env:GITHUB_WORKSPACE" `
+            /packagecachepath:"$env:GITHUB_WORKSPACE\.alpackages" `
+            /out:"$appFilePath" `
+            /analyzer:CodeCop `
+            /analyzer:UICop `
+            /analyzer:PerTenantExtensionCop `
+            /generatereportlayout-
+
+          $exitCode = $LASTEXITCODE
+
+          if ($exitCode -ne 0) {
+            Write-Host "::error::AL compilation failed — exit code $exitCode"
+            exit $exitCode
+          }
+
+          if (-not (Test-Path $appFilePath)) {
+            Write-Host "::error::.app file not found after compilation"
+            exit 1
+          }
+
+          $appSize = (Get-Item $appFilePath).Length / 1KB
+          Write-Host "✓ Compiled: $appFileName ($([math]::Round($appSize, 1)) KB)"
+          echo "artifactPath=$appFilePath" >> $env:GITHUB_OUTPUT
+          echo "artifactName=$appFileName" >> $env:GITHUB_OUTPUT
+          echo "outputDir=$outputDir" >> $env:GITHUB_OUTPUT
+
+      # ─────────────────────────────────────────
+      # 6. Upload .app as GitHub artifact
+      # ─────────────────────────────────────────
+      - name: Upload .app artifact
+        if: ${{ github.event.inputs.upload_artifact != 'false' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.app.outputs.publisher }}_${{ steps.app.outputs.name }}_${{ steps.app.outputs.version }}
+          path: ${{ steps.compile.outputs.artifactPath }}
+          retention-days: 30
+
+      # ─────────────────────────────────────────
+      # 7. Summary
+      # ─────────────────────────────────────────
+      - name: Build summary
+        if: always()
+        shell: pwsh
+        run: |
+          Write-Host "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          if ("${{ job.status }}" -eq "success") {
+            Write-Host "  ✓ Build succeeded"
+            Write-Host "  App:     ${{ steps.app.outputs.name }}"
+            Write-Host "  Version: ${{ steps.app.outputs.version }}"
+            Write-Host "  Artifact retained for 30 days"
+          } else {
+            Write-Host "  ✗ Build failed — see errors above"
+          }
+          Write-Host "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
