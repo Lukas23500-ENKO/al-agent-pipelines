@@ -1,0 +1,248 @@
+name: Test AL
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - '**.al'
+      - 'app.json'
+      - '.github/workflows/test-al.yml'
+  workflow_dispatch:
+    inputs:
+      bc_version:
+        description: 'BC artifact version (leave empty for latest)'
+        required: false
+        default: ''
+      test_filter:
+        description: 'Test codeunit filter (leave empty to run all tests)'
+        required: false
+        default: ''
+
+concurrency:
+  group: test-al-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Run AL Tests
+    # ─────────────────────────────────────────
+    # To migrate to self-hosted: replace with
+    # runs-on: self-hosted
+    # ─────────────────────────────────────────
+    runs-on: windows-latest
+
+    steps:
+      # ─────────────────────────────────────────
+      # 1. Checkout
+      # ─────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # ─────────────────────────────────────────
+      # 2. Read app.json metadata
+      # ─────────────────────────────────────────
+      - name: Read app.json
+        id: app
+        shell: pwsh
+        run: |
+          $appJson = Get-Content "app.json" | ConvertFrom-Json
+          echo "name=$($appJson.name)" >> $env:GITHUB_OUTPUT
+          echo "version=$($appJson.version)" >> $env:GITHUB_OUTPUT
+          echo "publisher=$($appJson.publisher)" >> $env:GITHUB_OUTPUT
+          echo "bcVersion=$($appJson.application)" >> $env:GITHUB_OUTPUT
+          Write-Host "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          Write-Host "  App:       $($appJson.name)"
+          Write-Host "  Version:   $($appJson.version)"
+          Write-Host "  BC target: $($appJson.application)+"
+          Write-Host "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+      # ─────────────────────────────────────────
+      # 3. Install BcContainerHelper
+      # ─────────────────────────────────────────
+      - name: Install BcContainerHelper
+        shell: pwsh
+        run: |
+          Set-PSRepository -Name PSGallery -InstallationPolicy Trusted
+          Install-Module BcContainerHelper -AllowClobber -Force
+          $version = Get-Module BcContainerHelper -ListAvailable |
+            Select-Object -First 1 -ExpandProperty Version
+          Write-Host "✓ BcContainerHelper $version installed"
+
+      # ─────────────────────────────────────────
+      # 4. Resolve BC artifact version
+      # ─────────────────────────────────────────
+      - name: Resolve BC artifact version
+        id: artifacts
+        shell: pwsh
+        run: |
+          $requestedVersion = "${{ github.event.inputs.bc_version }}"
+          if ([string]::IsNullOrEmpty($requestedVersion)) {
+            $requestedVersion = "${{ steps.app.outputs.bcVersion }}"
+          }
+
+          $artifactUrl = Get-BCArtifactUrl `
+            -type Sandbox `
+            -country w1 `
+            -version $requestedVersion `
+            -select Latest
+
+          Write-Host "✓ Resolved artifact: $artifactUrl"
+          echo "url=$artifactUrl" >> $env:GITHUB_OUTPUT
+
+      # ─────────────────────────────────────────
+      # 5. Create BC container
+      # ─────────────────────────────────────────
+      - name: Create BC test container
+        id: container
+        shell: pwsh
+        run: |
+          $containerName = "bc-test-${{ github.run_id }}"
+          echo "name=$containerName" >> $env:GITHUB_OUTPUT
+
+          Write-Host "▶ Creating BC container: $containerName"
+
+          New-BcContainer `
+            -accept_eula `
+            -accept_outdated `
+            -containerName $containerName `
+            -artifactUrl "${{ steps.artifacts.outputs.url }}" `
+            -auth NavUserPassword `
+            -credential (New-Object PSCredential "admin", (ConvertTo-SecureString "P@ssw0rd123!" -AsPlainText -Force)) `
+            -updateHosts `
+            -shortcuts None `
+            -doNotCheckHealth
+
+          Write-Host "✓ BC container created: $containerName"
+
+      # ─────────────────────────────────────────
+      # 6. Compile and publish app to container
+      # ─────────────────────────────────────────
+      - name: Compile & publish app to container
+        shell: pwsh
+        run: |
+          $containerName = "${{ steps.container.outputs.name }}"
+          $outputDir = Join-Path $env:RUNNER_TEMP "al-output"
+          New-Item -ItemType Directory -Force -Path $outputDir | Out-Null
+
+          $appFileName = "${{ steps.app.outputs.publisher }}_${{ steps.app.outputs.name }}_${{ steps.app.outputs.version }}.app"
+          $appFilePath = Join-Path $outputDir $appFileName
+
+          Write-Host "▶ Compiling app..."
+          Compile-AppInBcContainer `
+            -containerName $containerName `
+            -appProjectFolder $env:GITHUB_WORKSPACE `
+            -appOutputFolder $outputDir `
+            -credential (New-Object PSCredential "admin", (ConvertTo-SecureString "P@ssw0rd123!" -AsPlainText -Force))
+
+          Write-Host "▶ Publishing app to container..."
+          Publish-BcContainerApp `
+            -containerName $containerName `
+            -appFile $appFilePath `
+            -skipVerification `
+            -sync `
+            -install
+
+          Write-Host "✓ App published to container"
+
+      # ─────────────────────────────────────────
+      # 7. Compile and publish test app
+      # ─────────────────────────────────────────
+      - name: Compile & publish test app
+        shell: pwsh
+        run: |
+          $testDir = Join-Path $env:GITHUB_WORKSPACE "test"
+
+          if (-not (Test-Path $testDir)) {
+            Write-Host "⚠ No /test directory found — skipping test app publish"
+            exit 0
+          }
+
+          $containerName = "${{ steps.container.outputs.name }}"
+          $outputDir = Join-Path $env:RUNNER_TEMP "al-test-output"
+          New-Item -ItemType Directory -Force -Path $outputDir | Out-Null
+
+          Write-Host "▶ Compiling test app..."
+          Compile-AppInBcContainer `
+            -containerName $containerName `
+            -appProjectFolder $testDir `
+            -appOutputFolder $outputDir `
+            -credential (New-Object PSCredential "admin", (ConvertTo-SecureString "P@ssw0rd123!" -AsPlainText -Force))
+
+          $testAppFile = Get-ChildItem $outputDir -Filter "*.app" | Select-Object -First 1
+
+          if (-not $testAppFile) {
+            Write-Host "::error::Test app compilation produced no .app file"
+            exit 1
+          }
+
+          Write-Host "▶ Publishing test app..."
+          Publish-BcContainerApp `
+            -containerName $containerName `
+            -appFile $testAppFile.FullName `
+            -skipVerification `
+            -sync `
+            -install
+
+          Write-Host "✓ Test app published"
+
+      # ─────────────────────────────────────────
+      # 8. Run AL tests
+      # ─────────────────────────────────────────
+      - name: Run AL tests
+        id: tests
+        shell: pwsh
+        run: |
+          $containerName = "${{ steps.container.outputs.name }}"
+          $resultsPath = Join-Path $env:RUNNER_TEMP "test-results.xml"
+          $testFilter = "${{ github.event.inputs.test_filter }}"
+
+          Write-Host "▶ Running AL tests..."
+          if (-not [string]::IsNullOrEmpty($testFilter)) {
+            Write-Host "  Filter: $testFilter"
+          }
+
+          $params = @{
+            containerName  = $containerName
+            credential     = New-Object PSCredential "admin", (ConvertTo-SecureString "P@ssw0rd123!" -AsPlainText -Force)
+            XUnitResultFileName = $resultsPath
+            detailed       = $true
+          }
+
+          if (-not [string]::IsNullOrEmpty($testFilter)) {
+            $params.testCodeunit = $testFilter
+          }
+
+          Run-TestsInBcContainer @params
+
+          echo "resultsPath=$resultsPath" >> $env:GITHUB_OUTPUT
+          Write-Host "✓ Tests completed — results at $resultsPath"
+
+      # ─────────────────────────────────────────
+      # 9. Publish test results
+      # ─────────────────────────────────────────
+      - name: Publish test results
+        if: always()
+        uses: dorny/test-reporter@v1
+        with:
+          name: AL Test Results
+          path: ${{ steps.tests.outputs.resultsPath }}
+          reporter: java-junit
+          fail-on-error: true
+
+      # ─────────────────────────────────────────
+      # 10. Remove BC container (always)
+      # ─────────────────────────────────────────
+      - name: Remove BC container
+        if: always()
+        shell: pwsh
+        run: |
+          $containerName = "${{ steps.container.outputs.name }}"
+          if (Get-BcContainers | Where-Object { $_ -eq $containerName }) {
+            Remove-BcContainer -containerName $containerName
+            Write-Host "✓ Container $containerName removed"
+          } else {
+            Write-Host "⚠ Container $containerName not found — already removed"
+          }
